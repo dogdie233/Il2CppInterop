@@ -60,12 +60,21 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
 
     private static readonly List<object> DelegateCache = new();
     private static readonly List<object> DetourCache = new();
+    private readonly Dictionary<IntPtr, INativeMethodInfoStruct> modifiedNativeMethodInfoCache = new();  // key: income method info ptr
+    private static Dictionary<IntPtr, Il2CppDetourMethodPatcher> activePatchers = new();
 
     private INativeMethodInfoStruct modifiedNativeMethodInfo;
 
     private IDetour nativeDetour;
 
     private INativeMethodInfoStruct originalNativeMethodInfo;
+
+    public static ThreadLocal<IntPtr> currentMethodInfoPointer = new();
+    private static readonly FieldInfo currentMethodInfoPointerFieldInfo =
+        typeof(Il2CppDetourMethodPatcher).GetField(nameof(currentMethodInfoPointer),
+            BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+    private static readonly MethodInfo currentMethodInfoPointerSetMethodInfo =
+        typeof(ThreadLocal<IntPtr>).GetProperty("Value")!.GetSetMethod();
 
     /// <summary>
     ///     Constructs a new instance of <see cref="MonoMod.RuntimeDetour.NativeDetour" /> method patcher.
@@ -105,6 +114,7 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
             Buffer.MemoryCopy(originalNativeMethodInfo.Pointer.ToPointer(),
                 modifiedNativeMethodInfo.Pointer.ToPointer(), UnityVersionHandler.MethodSize(),
                 UnityVersionHandler.MethodSize());
+            activePatchers[modifiedNativeMethodInfo.Pointer] = this;
             IsValid = true;
         }
         catch (Exception e)
@@ -126,7 +136,9 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
         {
             // Point back to the original method before we unpatch
             modifiedNativeMethodInfo.MethodPointer = originalNativeMethodInfo.MethodPointer;
+            activePatchers.Remove(nativeDetour.OriginalTrampoline);
             nativeDetour.Dispose();
+            modifiedNativeMethodInfoCache.Clear();
         }
 
         // Generate a new DMD of the modified unhollowed method, and apply harmony patches to it
@@ -188,9 +200,31 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
         // Replace original IL2CPPMethodInfo pointer with a modified one that points to the trampoline
         cursor
             .Emit(Mono.Cecil.Cil.OpCodes.Ldc_I8, modifiedNativeMethodInfo.Pointer.ToInt64())
-            .Emit(Mono.Cecil.Cil.OpCodes.Conv_I);
+            .Emit(Mono.Cecil.Cil.OpCodes.Conv_I)
+            .Emit(Mono.Cecil.Cil.OpCodes.Call, typeof(Il2CppDetourMethodPatcher).GetMethod(nameof(GetModifiedMethodInfoPointerTyped), BindingFlags.Static | BindingFlags.NonPublic));
 
         return dmd;
+    }
+
+    private static IntPtr GetModifiedMethodInfoPointerTyped(IntPtr ptr)
+    {
+        if (!activePatchers.TryGetValue(ptr, out var patcher))
+            return ptr;
+
+        var incomeMethodInfoPtr = currentMethodInfoPointer.Value;
+        if (incomeMethodInfoPtr == IntPtr.Zero)
+            return ptr;
+
+        ref var nativeModifiedMethod = ref CollectionsMarshal.GetValueRefOrAddDefault(patcher.modifiedNativeMethodInfoCache, incomeMethodInfoPtr, out var exists);
+        if (!exists)
+        {
+            nativeModifiedMethod = UnityVersionHandler.NewMethod();
+            Buffer.MemoryCopy((void*)incomeMethodInfoPtr, nativeModifiedMethod.Pointer.ToPointer(), UnityVersionHandler.MethodSize(), UnityVersionHandler.MethodSize());
+
+            nativeModifiedMethod.MethodPointer = patcher.nativeDetour.OriginalTrampoline;
+        }
+
+        return nativeModifiedMethod.Pointer;
     }
 
     // Tries to guess whether a function needs a return buffer for the return struct, in all cases except win64 it's undefined behaviour
@@ -272,6 +306,10 @@ internal unsafe class Il2CppDetourMethodPatcher : MethodPatcher
 
         var il = dmd.GetILGenerator();
         il.BeginExceptionBlock();
+
+        il.Emit(OpCodes.Ldsfld, currentMethodInfoPointerFieldInfo);
+        il.Emit(OpCodes.Ldarg, unmanagedParams.Length - 1);
+        il.Emit(OpCodes.Call, currentMethodInfoPointerSetMethodInfo);
 
         // Declare a list of variables to dereference back to the original pointers.
         // This is required due to the needed interop type conversions, so we can't directly pass some addresses as byref types

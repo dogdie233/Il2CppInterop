@@ -40,6 +40,7 @@ public static class Il2CppClassPointerStore<T>
         if (!targetType.IsEnum)
         {
             RuntimeHelpers.RunClassConstructor(targetType.TypeHandle);
+
         }
         else
         {
